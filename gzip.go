@@ -195,11 +195,12 @@ func (w *GzipResponseWriter) startPlain() error {
 		return nil
 	}
 	n, err := w.ResponseWriter.Write(w.buf)
+	wrote := len(w.buf)
 	w.buf = nil
 	// This should never happen (per io.Writer docs), but if the write didn't
 	// accept the entire buffer but returned no specific error, we have no clue
 	// what's going on, so abort just to be safe.
-	if err == nil && n < len(w.buf) {
+	if err == nil && n < wrote {
 		err = io.ErrShortWrite
 	}
 	return err
