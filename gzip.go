@@ -76,8 +76,9 @@ func addLevelPool(level int) {
 // It can be configured to skip response smaller than minSize.
 type GzipResponseWriter struct {
 	http.ResponseWriter
-	index int // Index for gzipWriterPools.
-	gw    *gzip.Writer
+	index       int // Index for gzipWriterPools.
+	gw          *gzip.Writer
+	gzipPending bool
 
 	code int // Saves the WriteHeader value.
 
@@ -108,9 +109,17 @@ func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 		return w.ResponseWriter.Write(b)
 	}
 
+	w.WriteHeader(http.StatusOK)
+
 	// Save the write into a buffer for later use in GZIP responseWriter (if content is long enough) or at close with regular responseWriter.
 	// On the first write, w.buf changes from nil to a valid slice
 	w.buf = append(w.buf, b...)
+	if w.gzipPending {
+		if err := w.startGzip(); err != nil {
+			return 0, err
+		}
+		return len(b), nil
+	}
 
 	var (
 		cl, _ = strconv.Atoi(w.Header().Get(contentLength))
@@ -156,19 +165,18 @@ func (w *GzipResponseWriter) startGzip() error {
 	// See: https://github.com/golang/go/issues/14975.
 	w.Header().Del(contentLength)
 
-	// Write the header to gzip response.
-	if w.code != 0 {
-		w.ResponseWriter.WriteHeader(w.code)
-		// Ensure that no other WriteHeader's happen
-		w.code = 0
-	}
-
 	// Initialize and flush the buffer into the gzip response if there are any bytes.
 	// If there aren't any, we shouldn't initialize it yet because on Close it will
 	// write the gzip header even if nothing was ever written.
 	if len(w.buf) > 0 {
+		if w.code != 0 {
+			w.ResponseWriter.WriteHeader(w.code)
+			w.code = 0
+		}
+
 		// Initialize the GZIP response.
 		w.init()
+		w.gzipPending = false
 		n, err := w.gw.Write(w.buf)
 
 		// This should never happen (per io.Writer docs), but if the write didn't
@@ -179,6 +187,7 @@ func (w *GzipResponseWriter) startGzip() error {
 		}
 		return err
 	}
+	w.gzipPending = true
 	return nil
 }
 

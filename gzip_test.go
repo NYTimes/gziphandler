@@ -492,6 +492,134 @@ func TestIgnoreSubsequentWriteHeader(t *testing.T) {
 	}
 }
 
+func TestWriteCommitsResponseStatus(t *testing.T) {
+	largeBody := bytes.Repeat([]byte("x"), DefaultMinSize)
+	tests := []struct {
+		name       string
+		status     int
+		writes     [][]byte
+		lateStatus int
+		wantStatus int
+		wantGzip   bool
+	}{
+		{"short body", 0, [][]byte{[]byte("small")}, http.StatusInternalServerError, http.StatusOK, false},
+		{"nil write", 0, [][]byte{nil}, http.StatusInternalServerError, http.StatusOK, false},
+		{"empty write", 0, [][]byte{[]byte{}}, http.StatusInternalServerError, http.StatusOK, false},
+		{"compression after late status", 0, [][]byte{[]byte("small"), largeBody}, http.StatusInternalServerError, http.StatusOK, true},
+		{"explicit status before short body", http.StatusCreated, [][]byte{[]byte("small")}, http.StatusInternalServerError, http.StatusCreated, false},
+		{"explicit status before compression", http.StatusCreated, [][]byte{[]byte("small"), largeBody}, http.StatusInternalServerError, http.StatusCreated, true},
+		{"status without a write", 0, nil, http.StatusNotFound, http.StatusNotFound, false},
+		{"no status or write", 0, nil, 0, http.StatusOK, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, useGzip := range []bool{false, true} {
+				t.Run(fmt.Sprintf("gzip=%t", useGzip), func(t *testing.T) {
+					handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if test.status != 0 {
+							w.WriteHeader(test.status)
+						}
+						for i, body := range test.writes {
+							n, err := w.Write(body)
+							assert.NoError(t, err)
+							assert.Equal(t, len(body), n)
+							if i == 0 && test.lateStatus != 0 {
+								w.WriteHeader(test.lateStatus)
+							}
+						}
+						if len(test.writes) == 0 && test.lateStatus != 0 {
+							w.WriteHeader(test.lateStatus)
+						}
+					})
+					request := httptest.NewRequest(http.MethodGet, "/", nil)
+					response := httptest.NewRecorder()
+					if useGzip {
+						request.Header.Set(acceptEncoding, "gzip")
+						GzipHandler(handler).ServeHTTP(response, request)
+					} else {
+						handler.ServeHTTP(response, request)
+					}
+					assert.Equal(t, test.wantStatus, response.Code)
+					body := response.Body.Bytes()
+					if useGzip && test.wantGzip {
+						assert.Equal(t, "gzip", response.Header().Get(contentEncoding))
+						reader, err := gzip.NewReader(response.Body)
+						if !assert.NoError(t, err) {
+							return
+						}
+						body, err = ioutil.ReadAll(reader)
+						assert.NoError(t, err)
+						assert.NoError(t, reader.Close())
+					} else {
+						assert.Empty(t, response.Header().Get(contentEncoding))
+					}
+					assert.Equal(t, string(bytes.Join(test.writes, nil)), string(body))
+				})
+			}
+		})
+	}
+}
+
+func TestEmptyWritePreservesStatus(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), DefaultMinSize)
+	tests := []struct {
+		name          string
+		minSize       int
+		contentLength bool
+		status        int
+		wantStatus    int
+	}{
+		{"zero minimum", 0, false, 0, http.StatusOK},
+		{"known content length", DefaultMinSize, true, 0, http.StatusOK},
+		{"explicit status with zero minimum", 0, false, http.StatusCreated, http.StatusCreated},
+		{"explicit status with content length", DefaultMinSize, true, http.StatusCreated, http.StatusCreated},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wrap, err := NewGzipLevelAndMinSize(gzip.DefaultCompression, test.minSize)
+			if !assert.NoError(t, err) {
+				return
+			}
+			handler := wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if test.contentLength {
+					w.Header().Set(contentLength, strconv.Itoa(len(body)))
+				}
+				if test.status != 0 {
+					w.WriteHeader(test.status)
+				}
+				n, err := w.Write(nil)
+				assert.NoError(t, err)
+				assert.Zero(t, n)
+				w.WriteHeader(http.StatusInternalServerError)
+				n, err = w.Write(nil)
+				assert.NoError(t, err)
+				assert.Zero(t, n)
+				n, err = w.Write(body)
+				assert.NoError(t, err)
+				assert.Equal(t, len(body), n)
+			}))
+			request := httptest.NewRequest(http.MethodGet, "/", nil)
+			request.Header.Set(acceptEncoding, "gzip")
+			response := httptest.NewRecorder()
+			writer := &panicOnSecondWriteHeaderWriter{ResponseWriter: response}
+			if !assert.NotPanics(t, func() { handler.ServeHTTP(writer, request) }) {
+				return
+			}
+			assert.True(t, writer.headerWritten)
+			assert.Equal(t, test.wantStatus, response.Code)
+			assert.Equal(t, "gzip", response.Header().Get(contentEncoding))
+			reader, err := gzip.NewReader(response.Body)
+			if !assert.NoError(t, err) {
+				return
+			}
+			decoded, err := ioutil.ReadAll(reader)
+			assert.NoError(t, err)
+			assert.NoError(t, reader.Close())
+			assert.Equal(t, body, decoded)
+		})
+	}
+}
+
 func TestDontWriteWhenNotWrittenTo(t *testing.T) {
 	// When using gzip as middleware without ANY writes in the handler,
 	// ensure the gzip middleware doesn't touch the actual ResponseWriter
